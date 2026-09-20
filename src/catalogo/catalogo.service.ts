@@ -279,17 +279,37 @@ export interface HeroItem {
 export class CatalogoService {
   private readonly logger = new Logger(CatalogoService.name);
 
+  // Caché general de respuestas crudas de Tenrai (keyed por URL completa)
+  private cacheTenrai = new Map<string, { datos: unknown; expira: number }>();
+  // Deduplicación: si la misma URL ya está en vuelo, reutilizar la promesa
+  private enVuelo = new Map<string, Promise<unknown>>();
+
   constructor(private readonly prisma: PrismaService) {}
 
-  // ─── PETICIÓN CON RATE-LIMITING ───────────────────────────────────────────
+  // ─── PETICIÓN CON RATE-LIMITING + CACHÉ + DEDUPLICACIÓN ────────────────────
 
-  private async pedirTenrai<T>(endpoint: string): Promise<T> {
+  private async pedirTenrai<T>(endpoint: string, ttlMs = 5 * 60 * 1000): Promise<T> {
+    const url = `${TENRAI_BASE}${endpoint}`;
+    const ahora = Date.now();
+
+    // 1. Si está cacheado y no expiró, devolver directo
+    const cacheado = this.cacheTenrai.get(url);
+    if (cacheado && cacheado.expira > ahora) {
+      return cacheado.datos as T;
+    }
+
+    // 2. Si la misma URL ya está en vuelo, reutilizar la promesa (dedup)
+    const existente = this.enVuelo.get(url);
+    if (existente) {
+      return existente as Promise<T>;
+    }
+
+    // 3. Encolar con reintentos
     const ejecutar = async (): Promise<T> => {
       for (let i = 0; i < MAX_INTENTOS; i++) {
         try {
-          const res: AxiosResponse<T> = await axios.get(`${TENRAI_BASE}${endpoint}`, {
-            timeout: 15000,
-          });
+          const res: AxiosResponse<T> = await axios.get(url, { timeout: 15000 });
+          this.cacheTenrai.set(url, { datos: res.data, expira: Date.now() + ttlMs });
           return res.data;
         } catch (err: unknown) {
           const status = (err as { response?: { status?: number } })?.response?.status;
@@ -297,15 +317,24 @@ export class CatalogoService {
             await esperar(1000 * Math.pow(2, i));
             continue;
           }
+          // En 403, devolver dato stale si existe
+          if (status === 403 && cacheado) {
+            this.logger.warn(`Tenrai bloqueó ${endpoint}, usando caché stale`);
+            return cacheado.datos as T;
+          }
           throw err;
         }
       }
       throw new Error('La API de Tenrai no respondió tras los reintentos');
     };
 
-    const siguiente = cola.then(ejecutar);
-    cola = siguiente.then(() => esperar(350), () => esperar(350));
-    return siguiente;
+    const promesa = cola.then(ejecutar);
+    cola = promesa.then(() => esperar(500), () => esperar(500));
+
+    this.enVuelo.set(url, promesa);
+    promesa.finally(() => this.enVuelo.delete(url));
+
+    return promesa;
   }
 
   // ─── HELPERS DE MAPEO ────────────────────────────────────────────────────
@@ -462,13 +491,14 @@ export class CatalogoService {
   // ─── DETALLE DE ANIME ────────────────────────────────────────────────────
 
   async obtenerDetalleAnime(id: number): Promise<AnimeDetalle> {
-    const [{ data: base }, { data: personajes }, { data: episodios }, { data: relaciones }, { data: recomendaciones }] =
+    // /full ya incluye relations y recommendations inline — no necesitamos endpoints separados
+    const [{ data: base }, { data: personajes }, { data: episodios }] =
       await Promise.all([
-        this.pedirTenrai<{ data: ApiAnime }>(`/anime/${id}/full`),
+        this.pedirTenrai<{ data: ApiAnime & { relations?: ApiRelation[]; recommendations?: ApiRecommendation[] } }>(
+          `/anime/${id}/full`,
+        ),
         this.pedirTenrai<{ data: ApiCharacter[] }>(`/anime/${id}/characters`),
         this.pedirTenrai<{ data: ApiEpisode[] }>(`/anime/${id}/episodes`),
-        this.pedirTenrai<{ data: ApiRelation[] }>(`/anime/${id}/relations`),
-        this.pedirTenrai<{ data: ApiRecommendation[] }>(`/anime/${id}/recommendations`),
       ]);
 
     const detalle = this.mapearAnimeDetalle(base);
@@ -486,12 +516,12 @@ export class CatalogoService {
       fecha: ep.aired ?? '',
     }));
 
-    // Relacionados: traer info de cada anime relacionado
-    const idsRelacionados = (relaciones || [])
+    // Relacionados: extraer IDs del /full, traer info de cada uno (max 5)
+    const idsRelacionados = ((base as unknown as { relations?: ApiRelation[] }).relations || [])
       .flatMap(r => (r.entry || []).filter(e => e.type === 'anime').map(e => e.mal_id))
       .filter((v): v is number => v != null && v > 0)
       .filter((v, i, a) => a.indexOf(v) === i)
-      .slice(0, 8);
+      .slice(0, 5);
 
     detalle.relacionados = (
       await Promise.allSettled(
@@ -512,30 +542,18 @@ export class CatalogoService {
       .map(r => r.value)
       .filter(r => r.img);
 
-    // Similares/recomendados
-    const idsSimilares = (recomendaciones || [])
-      .map(r => r.entry?.mal_id)
-      .filter((v): v is number => v != null && v > 0)
-      .filter((v, i, a) => a.indexOf(v) === i)
-      .slice(0, 8);
-
-    detalle.similares = (
-      await Promise.allSettled(
-        idsSimilares.map(async recId => {
-          const { data: rec } = await this.pedirTenrai<{ data: ApiAnime }>(`/anime/${recId}`);
-          return {
-            id: recId,
-            title: rec.title || 'Sin título',
-            year: rec.year ?? rec.aired?.prop?.from?.year ?? 0,
-            score: rec.score ?? 0,
-            type: rec.type || 'TV',
-            img: rec.images?.jpg?.large_image_url || rec.images?.jpg?.image_url || '',
-          };
-        }),
-      )
-    )
-      .filter((r): r is PromiseFulfilledResult<AnimeCard> => r.status === 'fulfilled')
-      .map(r => r.value);
+    // Similares: extraer del /full (ya incluye images + title, sin fetch extra)
+    detalle.similares = ((base as unknown as { recommendations?: ApiRecommendation[] }).recommendations || [])
+      .slice(0, 5)
+      .map(r => ({
+        id: r.entry?.mal_id ?? 0,
+        title: r.entry?.title ?? '',
+        year: 0,
+        score: 0,
+        type: 'TV',
+        img: r.entry?.images?.jpg?.large_image_url || r.entry?.images?.jpg?.image_url || '',
+      }))
+      .filter(r => r.id > 0);
 
     return detalle;
   }
@@ -543,9 +561,9 @@ export class CatalogoService {
   // ─── DETALLE DE MANGA ────────────────────────────────────────────────────
 
   async obtenerDetalleManga(id: number): Promise<MangaDetalle> {
-    const [{ data: base }, { data: recomendaciones }, { data: personajes }] = await Promise.all([
-      this.pedirTenrai<{ data: ApiManga }>(`/manga/${id}/full`),
-      this.pedirTenrai<{ data: ApiRecommendation[] }>(`/manga/${id}/recommendations`),
+    // /full ya incluye recommendations inline
+    const [{ data: base }, { data: personajes }] = await Promise.all([
+      this.pedirTenrai<{ data: ApiManga & { recommendations?: ApiRecommendation[] } }>(`/manga/${id}/full`),
       this.pedirTenrai<{ data: ApiCharacter[] }>(`/manga/${id}/characters`),
     ]);
 
@@ -558,14 +576,18 @@ export class CatalogoService {
       seiyuu: c.voice_actors?.[0]?.person?.name,
     }));
 
-    detalle.similares = (recomendaciones || []).slice(0, 8).map(r => ({
-      id: r.entry?.mal_id ?? 0,
-      title: r.entry?.title ?? '',
-      year: 0,
-      score: 0,
-      type: 'Manga',
-      img: r.entry?.images?.jpg?.large_image_url || r.entry?.images?.jpg?.image_url || '',
-    }));
+    // Similares: del /full (ya incluye images + title, sin fetch extra)
+    detalle.similares = ((base as unknown as { recommendations?: ApiRecommendation[] }).recommendations || [])
+      .slice(0, 5)
+      .map(r => ({
+        id: r.entry?.mal_id ?? 0,
+        title: r.entry?.title ?? '',
+        year: 0,
+        score: 0,
+        type: 'Manga',
+        img: r.entry?.images?.jpg?.large_image_url || r.entry?.images?.jpg?.image_url || '',
+      }))
+      .filter(r => r.id > 0);
 
     return detalle;
   }
